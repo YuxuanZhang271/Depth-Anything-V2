@@ -5,6 +5,7 @@ import matplotlib
 import numpy as np
 import os
 import torch
+from tqdm import tqdm  # <-- NEW IMPORT
 
 from depth_anything_v2.dpt import DepthAnythingV2
 
@@ -47,6 +48,19 @@ if __name__ == '__main__':
     
     os.makedirs(args.outdir, exist_ok=True)
     
+    # ---------- NEW: Configuration summary ----------
+    print("\n=== Configuration Summary ===")
+    print(f"Video path:        {args.video_path}")
+    print(f"Input size:        {args.input_size}")
+    print(f"Output directory:  {args.outdir}")
+    print(f"Encoder:           {args.encoder}")
+    print(f"Prediction only:   {args.pred_only}")
+    print(f"Grayscale:         {args.grayscale}")
+    print(f"Device:            {DEVICE}")
+    print(f"Number of files:   {len(filenames)}")
+    print("==============================\n")
+    # ------------------------------------------------
+    
     margin_width = 50
     cmap = matplotlib.colormaps.get_cmap('Spectral_r')
     
@@ -54,16 +68,29 @@ if __name__ == '__main__':
         print(f'Progress {k+1}/{len(filenames)}: {filename}')
         
         raw_video = cv2.VideoCapture(filename)
-        frame_width, frame_height = int(raw_video.get(cv2.CAP_PROP_FRAME_WIDTH)), int(raw_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if not raw_video.isOpened():
+            print(f"  Warning: Could not open video {filename}. Skipping.")
+            continue
+        
+        frame_width = int(raw_video.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(raw_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
         frame_rate = int(raw_video.get(cv2.CAP_PROP_FPS))
+        total_frames = int(raw_video.get(cv2.CAP_PROP_FRAME_COUNT))
         
         if args.pred_only: 
             output_width = frame_width
         else: 
             output_width = frame_width * 2 + margin_width
         
-        output_path = os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '.mp4')
+        output_path = os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '_' + args.encoder + '.mp4')
         out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), frame_rate, (output_width, frame_height))
+        
+        # ---------- NEW: Progress bar for frames ----------
+        # Use total_frames if available, otherwise run without a known total
+        pbar = tqdm(total=total_frames if total_frames > 0 else None,
+                    desc=f"  Processing {os.path.basename(filename)}",
+                    unit='frame', leave=(k == len(filenames) - 1))
+        # ---------------------------------------------------
         
         while raw_video.isOpened():
             ret, raw_frame = raw_video.read()
@@ -85,8 +112,12 @@ if __name__ == '__main__':
             else:
                 split_region = np.ones((frame_height, margin_width, 3), dtype=np.uint8) * 255
                 combined_frame = cv2.hconcat([raw_frame, split_region, depth])
-                
                 out.write(combined_frame)
+            
+            # ---------- NEW: Update progress bar ----------
+            pbar.update(1)
+            # ---------------------------------------------
         
+        pbar.close()   # close the progress bar
         raw_video.release()
         out.release()

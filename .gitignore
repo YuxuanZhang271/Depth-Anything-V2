@@ -1,0 +1,53 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- Packaging / virtualenvs ---
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDEs / editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Model checkpoints (downloaded separately — see README) ---
+checkpoints/*
+!checkpoints/.gitkeep
+*.pth
+*.pt
+*.onnx
+*.engine
+*.trt
+*.safetensors
+*.ckpt
+
+# --- Generated output ---
+vis_video_depth/
+vis_video_depth_trt/
+
+# --- Logs / temp ---
+*.log
+*.tmp

@@ -1,0 +1,26 @@
+# Normalize line endings for text files
+* text=auto
+
+# Source / config files -> LF
+*.py   text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.txt  text eol=lf
+*.sh   text eol=lf
+*.json text eol=lf
+*.cfg  text eol=lf
+
+# Images / video
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.mp4  binary
+
+# Model files are binary (no diffing / CRLF normalization)
+*.pth    binary
+*.pt     binary
+*.onnx   binary
+*.engine binary
+*.trt    binary
