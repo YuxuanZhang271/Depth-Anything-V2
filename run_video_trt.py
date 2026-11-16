@@ -1,7 +1,6 @@
 import argparse
 import cv2
 import glob
-import matplotlib
 import numpy as np
 import os
 import tensorrt as trt
@@ -118,8 +117,6 @@ if __name__ == '__main__':
     parser.add_argument('--outdir', type=str, default='./vis_video_depth_trt')
     parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
     parser.add_argument('--engine', type=str, default='depth_anything_v2.engine', help='Path to TensorRT engine')
-    parser.add_argument('--pred-only', action='store_true')
-    parser.add_argument('--grayscale', action='store_true')
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -137,10 +134,6 @@ if __name__ == '__main__':
     else:
         filenames = glob.glob(os.path.join(args.video_path, '**/*'), recursive=True)
 
-    margin_width = 50
-    # Fix for Matplotlib < 3.6: use colormaps['Spectral_r'] directly
-    cmap = matplotlib.colormaps['Spectral_r']
-
     for k, filename in enumerate(filenames):
         print(f'Progress {k+1}/{len(filenames)}: {filename}')
         raw_video = cv2.VideoCapture(filename)
@@ -150,17 +143,15 @@ if __name__ == '__main__':
 
         frame_width = int(raw_video.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(raw_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_rate = int(raw_video.get(cv2.CAP_PROP_FPS))
+        frame_rate = float(raw_video.get(cv2.CAP_PROP_FPS))
+        if frame_rate == 0:
+            frame_rate = 30.0
         total_frames = int(raw_video.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        if args.pred_only:
-            output_width = frame_width
-        else:
-            output_width = frame_width * 2 + margin_width
-
-        output_filename = os.path.splitext(os.path.basename(filename))[0] + '_' + args.encoder + '_trt.mp4'
+        output_filename = os.path.splitext(os.path.basename(filename))[0] + '_depth.npz'
         output_path = os.path.join(args.outdir, output_filename)
-        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), frame_rate, (output_width, frame_height))
+
+        depth_frames = []
 
         pbar = tqdm(total=total_frames if total_frames > 0 else None,
                     desc=f"  Processing {os.path.basename(filename)}",
@@ -171,30 +162,26 @@ if __name__ == '__main__':
             if not ret:
                 break
 
-            depth_small = trt_model.infer(raw_frame)  # (input_size, input_size)
+            depth_small = trt_model.infer(raw_frame)  # (input_size, input_size), float32 RAW
 
-            # Resize depth to original frame size
+            # Resize depth to original frame size (raw values preserved)
             depth = cv2.resize(depth_small, (frame_width, frame_height), interpolation=cv2.INTER_LINEAR)
 
-            # Normalize to 0-255 for visualization
-            depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
-            depth = depth.astype(np.uint8)
-
-            if args.grayscale:
-                depth = np.repeat(depth[..., np.newaxis], 3, axis=-1)
-            else:
-                depth = (cmap(depth)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
-
-            if args.pred_only:
-                out.write(depth)
-            else:
-                split_region = np.ones((frame_height, margin_width, 3), dtype=np.uint8) * 255
-                combined_frame = cv2.hconcat([raw_frame, split_region, depth])
-                out.write(combined_frame)
+            # Keep raw depth data as float16
+            depth_frames.append(depth.astype(np.float16))
 
             pbar.update(1)
 
         pbar.close()
         raw_video.release()
-        out.release()
+
+        depths = np.stack(depth_frames, axis=0)  # (N, H, W) float16
+        np.savez(
+            output_path,
+            depths=depths,
+            fps=frame_rate,
+            width=frame_width,
+            height=frame_height,
+            video_path=os.path.abspath(filename),
+        )
         print(f"  Saved to {output_path}")

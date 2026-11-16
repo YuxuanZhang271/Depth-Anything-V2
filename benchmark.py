@@ -3,14 +3,20 @@
 Full benchmark for Depth Anything V2:
 - Methods: torch, tensorrt
 - Encoders: vits, vitb, vitl
-- Dtype (TRT): fp16, fp32
+- Dtype (TRT): fp16, fp32, int8
+- Variant (TRT): arbitrary tag between encoder and dtype (e.g. '3060', 'jetson')
 
-Measures average inference time per frame (after 10 warm-up frames)
-and peak GPU memory usage (via pynvml).
+Discovers engines / checkpoints dynamically from ./checkpoints.
+Measures average inference time per frame (after warm-up) and GPU memory.
 """
 
 import argparse
+import glob
+import os
+import re
 import time
+from pathlib import Path
+
 import numpy as np
 import cv2
 import torch
@@ -18,27 +24,66 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 import tensorrt as trt
 from depth_anything_v2.dpt import DepthAnythingV2
-import os
 
 # ---------- Configuration ----------
 FRAME_HEIGHT = 480
-FRAME_WIDTH = 640          # typical 480p
+FRAME_WIDTH = 640
 INPUT_SIZE = 518
 WARMUP = 10
 TEST = 20
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 CHECKPOINT_DIR = './checkpoints'
-ENGINE_PATTERN = os.path.join(CHECKPOINT_DIR, 'depth_anything_v2_{encoder}_{dtype}.engine')
-MODEL_PATTERN = os.path.join(CHECKPOINT_DIR, 'depth_anything_v2_{encoder}.pth')
 
-# Model configs (same as in run_video.py)
 MODEL_CONFIGS = {
-    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+    'vits': {'encoder': 'vits', 'features': 64,  'out_channels': [48, 96, 192, 384]},
     'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
 }
 
-# ---------- TensorRT inference class (same as run_video_trt.py) ----------
+# Filename convention: depth_anything_v2_<encoder>[_<variant>]_<dtype>.engine
+_ENGINE_RE = re.compile(
+    r'^depth_anything_v2_(?P<encoder>vits|vitb|vitl)'
+    r'(?:_(?P<variant>[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*?))?'
+    r'_(?P<dtype>fp16|fp32|int8)\.engine$'
+)
+_CHECKPOINT_RE = re.compile(r'^depth_anything_v2_(?P<encoder>vits|vitb|vitl)\.pth$')
+
+
+# ---------- Dynamic discovery ----------
+def discover_engines(checkpoint_dir, dtypes=None, variants=None, encoders=None):
+    """Return list of dicts: {path, encoder, variant, dtype}. Only existing files."""
+    found = []
+    for path in sorted(glob.glob(os.path.join(checkpoint_dir, '*.engine'))):
+        m = _ENGINE_RE.match(Path(path).name)
+        if not m:
+            print(f"  [skip] Unrecognised engine name: {Path(path).name}")
+            continue
+        info = m.groupdict()
+        info['variant'] = info['variant'] or 'default'
+        info['path'] = path
+        if dtypes   and info['dtype']   not in dtypes:   continue
+        if variants and info['variant'] not in variants: continue
+        if encoders and info['encoder'] not in encoders: continue
+        found.append(info)
+    return found
+
+
+def discover_checkpoints(checkpoint_dir, encoders=None):
+    """Return dict {encoder: path} for available .pth files."""
+    found = {}
+    for path in sorted(glob.glob(os.path.join(checkpoint_dir, '*.pth'))):
+        m = _CHECKPOINT_RE.match(Path(path).name)
+        if not m:
+            print(f"  [skip] Unrecognised checkpoint name: {Path(path).name}")
+            continue
+        enc = m.group('encoder')
+        if encoders and enc not in encoders:
+            continue
+        found[enc] = path
+    return found
+
+
+# ---------- TensorRT inference ----------
 class TRTInference:
     def __init__(self, engine_path, input_size):
         self.input_size = input_size
@@ -48,33 +93,22 @@ class TRTInference:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
 
-        self.input_names = []
-        self.output_names = []
+        self.input_names, self.output_names = [], []
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
-            mode = self.engine.get_tensor_mode(name)
-            if mode == trt.TensorIOMode.INPUT:
-                self.input_names.append(name)
-            else:
-                self.output_names.append(name)
+            (self.input_names if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+             else self.output_names).append(name)
 
         self.input_name = self.input_names[0]
         self.output_name = self.output_names[0]
-        input_shape = (1, 3, input_size, input_size)
-        self.context.set_input_shape(self.input_name, input_shape)
+        self.context.set_input_shape(self.input_name, (1, 3, input_size, input_size))
 
         in_shape = self.context.get_tensor_shape(self.input_name)
         out_shape = self.context.get_tensor_shape(self.output_name)
+        vol = lambda s: int(np.prod(s))
 
-        def volume(shape):
-            vol = 1
-            for d in shape:
-                vol *= d
-            return vol
-
-        self.input_volume = volume(in_shape)
-        self.output_volume = volume(out_shape)
-
+        self.input_volume = vol(in_shape)
+        self.output_volume = vol(out_shape)
         self.input_dtype = trt.nptype(self.engine.get_tensor_dtype(self.input_name))
         self.output_dtype = trt.nptype(self.engine.get_tensor_dtype(self.output_name))
 
@@ -85,23 +119,17 @@ class TRTInference:
 
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
-            if name == self.input_name:
-                self.context.set_tensor_address(name, int(self.device_input))
-            elif name == self.output_name:
-                self.context.set_tensor_address(name, int(self.device_output))
-            else:
-                raise RuntimeError(f"Unexpected tensor: {name}")
+            addr = int(self.device_input) if name == self.input_name else int(self.device_output)
+            self.context.set_tensor_address(name, addr)
 
         self.stream = cuda.Stream()
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     def infer(self, input_image):
-        # Resize and preprocess exactly as in run_video_trt.py
         resized = cv2.resize(input_image, (self.input_size, self.input_size))
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        normalized = (rgb - mean) / std
-        chw = np.transpose(normalized, (2, 0, 1))[None, ...]
+        chw = np.transpose((rgb - self.mean) / self.std, (2, 0, 1))[None, ...]
 
         np.copyto(self.host_input, chw.ravel())
         cuda.memcpy_htod_async(self.device_input, self.host_input, self.stream)
@@ -109,135 +137,131 @@ class TRTInference:
         cuda.memcpy_dtoh_async(self.host_output, self.device_output, self.stream)
         self.stream.synchronize()
 
-        depth = self.host_output.reshape(1, 1, self.input_size, self.input_size)
-        depth = np.squeeze(depth, axis=0)  # (1, H, W)
-        depth = np.squeeze(depth, axis=0)  # (H, W)
-        return depth
+        return self.host_output.reshape(self.input_size, self.input_size)
+
 
 # ---------- Benchmarking ----------
-def get_gpu_memory(handle):
-    """Return used GPU memory in MB (via PyTorch, no NVML required)."""
+def get_gpu_memory():
     free, total = torch.cuda.mem_get_info()
     return (total - free) // (1024 * 1024)
 
+
 def generate_frame(height=FRAME_HEIGHT, width=FRAME_WIDTH):
-    """Generate a random BGR frame."""
     return np.random.randint(0, 255, (height, width, 3), dtype=np.uint8)
 
-def benchmark_torch(encoder, handle):
-    """Benchmark PyTorch model."""
-    print(f"Loading torch model {encoder}...")
-    config = MODEL_CONFIGS[encoder]
-    model = DepthAnythingV2(**config)
-    model.load_state_dict(torch.load(MODEL_PATTERN.format(encoder=encoder), map_location='cpu'))
+
+def benchmark_torch(encoder, checkpoint_path):
+    print(f"Loading torch model {encoder} from {checkpoint_path}...")
+    model = DepthAnythingV2(**MODEL_CONFIGS[encoder])
+    model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
     model = model.to(DEVICE).eval()
 
-    # Baseline memory after model load
-    baseline = get_gpu_memory(handle)
-    print(f"  Baseline memory: {baseline} MB")
-
-    # Warm-up
+    baseline = get_gpu_memory()
     for _ in range(WARMUP):
-        frame = generate_frame()
         with torch.no_grad():
-            _ = model.infer_image(frame, INPUT_SIZE)
+            model.infer_image(generate_frame(), INPUT_SIZE)
 
-    # Test
-    times = []
-    mem_peaks = []
+    times, mems = [], []
     for _ in range(TEST):
         frame = generate_frame()
         torch.cuda.synchronize()
-        start = time.perf_counter()
+        t0 = time.perf_counter()
         with torch.no_grad():
-            _ = model.infer_image(frame, INPUT_SIZE)
+            model.infer_image(frame, INPUT_SIZE)
         torch.cuda.synchronize()
-        end = time.perf_counter()
-        times.append((end - start) * 1000)  # ms
-        # Record memory after inference
-        mem_peaks.append(get_gpu_memory(handle))
+        times.append((time.perf_counter() - t0) * 1000)
+        mems.append(get_gpu_memory())
 
-    avg_time = np.mean(times)
-    peak_mem = max(mem_peaks) - baseline
-    return avg_time, peak_mem
+    return float(np.mean(times)), float(max(mems) - baseline)
 
-def benchmark_trt(encoder, dtype, handle):
-    """Benchmark TensorRT model."""
-    engine_path = ENGINE_PATTERN.format(encoder=encoder, dtype=dtype)
+
+def benchmark_trt(engine_path):
     print(f"Loading TRT engine {engine_path}...")
     model = TRTInference(engine_path, INPUT_SIZE)
 
-    # Baseline memory after engine load (buffers allocated)
-    baseline = get_gpu_memory(handle)
-    print(f"  Baseline memory: {baseline} MB")
-
-    # Warm-up
+    baseline = get_gpu_memory()
     for _ in range(WARMUP):
-        frame = generate_frame()
-        _ = model.infer(frame)
+        model.infer(generate_frame())
 
-    # Test
-    times = []
-    mem_peaks = []
+    times, mems = [], []
     for _ in range(TEST):
         frame = generate_frame()
-        start = time.perf_counter()
-        _ = model.infer(frame)
-        cuda.Context.synchronize()  # ensure all operations done
-        end = time.perf_counter()
-        times.append((end - start) * 1000)
-        mem_peaks.append(get_gpu_memory(handle))
+        t0 = time.perf_counter()
+        model.infer(frame)
+        cuda.Context.synchronize()
+        times.append((time.perf_counter() - t0) * 1000)
+        mems.append(get_gpu_memory())
 
-    avg_time = np.mean(times)
-    peak_mem = max(mem_peaks) - baseline
-    return avg_time, peak_mem
+    return float(np.mean(times)), float(max(mems) - baseline)
 
+
+# ---------- Main ----------
 def main():
-    # GPU memory is read via torch.cuda.mem_get_info(); NVML handle not needed
-    handle = None
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint-dir', default=CHECKPOINT_DIR)
+    parser.add_argument('--encoders', nargs='+', default=None,
+                        choices=list(MODEL_CONFIGS), help='Filter encoders')
+    parser.add_argument('--dtypes', nargs='+', default=None,
+                        choices=['fp16', 'fp32', 'int8'])
+    parser.add_argument('--variants', nargs='+', default=None,
+                        help='Filter engine variants, e.g. 3060 jetson')
+    parser.add_argument('--skip-torch', action='store_true')
+    parser.add_argument('--skip-trt', action='store_true')
+    args = parser.parse_args()
 
-    # Results storage
-    results = []
+    # Discover
+    print(f"Scanning {args.checkpoint_dir} ...")
+    checkpoints = discover_checkpoints(args.checkpoint_dir, args.encoders)
+    engines = discover_engines(args.checkpoint_dir, args.dtypes, args.variants, args.encoders)
 
-    encoders = ['vits', 'vitb', 'vitl']
+    print(f"  Found {len(checkpoints)} torch checkpoint(s): {sorted(checkpoints)}")
+    print(f"  Found {len(engines)} TRT engine(s):")
+    for e in engines:
+        print(f"    - {Path(e['path']).name}  (enc={e['encoder']}, variant={e['variant']}, dtype={e['dtype']})")
 
-    # 1. PyTorch
-    for enc in encoders:
-        print(f"\n=== Benchmarking torch + {enc} ===")
-        avg_time, peak_mem = benchmark_torch(enc, handle)
-        results.append({
-            'encoder': enc,
-            'method': 'torch',
-            'dtype': '-',
-            'avg_time_ms': avg_time,
-            'peak_mem_mb': peak_mem
-        })
+    results, skipped = [], []
 
-    # 2. TensorRT fp16 & fp32
-    for enc in encoders:
-        for dtype in ['fp16', 'fp32']:
-            print(f"\n=== Benchmarking tensorrt + {enc} + {dtype} ===")
+    # 1. Torch
+    if not args.skip_torch:
+        for enc in (args.encoders or list(MODEL_CONFIGS)):
+            if enc not in checkpoints:
+                skipped.append((enc, 'torch', '-', '-', 'checkpoint missing'))
+                continue
+            print(f"\n=== Benchmarking torch + {enc} ===")
             try:
-                avg_time, peak_mem = benchmark_trt(enc, dtype, handle)
-                results.append({
-                    'encoder': enc,
-                    'method': 'tensorrt',
-                    'dtype': dtype,
-                    'avg_time_ms': avg_time,
-                    'peak_mem_mb': peak_mem
-                })
-            except FileNotFoundError:
-                print(f"  Engine not found for {enc} {dtype}, skipping.")
-            except Exception as e:
-                print(f"  Error: {e}")
+                t, m = benchmark_torch(enc, checkpoints[enc])
+                results.append(dict(encoder=enc, method='torch', dtype='-',
+                                    variant='-', avg_time_ms=t, peak_mem_mb=m))
+            except Exception as ex:
+                skipped.append((enc, 'torch', '-', '-', f'error: {ex}'))
 
-    # Print summary table
+    # 2. TensorRT — one row per discovered engine
+    if not args.skip_trt:
+        for e in engines:
+            print(f"\n=== Benchmarking tensorrt + {e['encoder']} + {e['variant']} + {e['dtype']} ===")
+            try:
+                t, m = benchmark_trt(e['path'])
+                results.append(dict(encoder=e['encoder'], method='tensorrt',
+                                    dtype=e['dtype'], variant=e['variant'],
+                                    avg_time_ms=t, peak_mem_mb=m))
+            except Exception as ex:
+                skipped.append((e['encoder'], 'tensorrt', e['dtype'], e['variant'], f'error: {ex}'))
+
+    # Summary
     print("\n\n========== Summary ==========")
-    print(f"{'Encoder':<8} {'Method':<10} {'Dtype':<6} {'Avg Time (ms)':<15} {'Peak Mem (MB)':<15}")
-    print("-" * 60)
+    hdr = f"{'Encoder':<8} {'Method':<10} {'Dtype':<6} {'Variant':<10} {'Avg Time (ms)':<15} {'Peak Mem (MB)':<15}"
+    print(hdr)
+    print("-" * len(hdr))
     for r in results:
-        print(f"{r['encoder']:<8} {r['method']:<10} {r['dtype']:<6} {r['avg_time_ms']:<15.2f} {r['peak_mem_mb']:<15.2f}")
+        print(f"{r['encoder']:<8} {r['method']:<10} {r['dtype']:<6} {r['variant']:<10} "
+              f"{r['avg_time_ms']:<15.2f} {r['peak_mem_mb']:<15.2f}")
+
+    if skipped:
+        print("\nSkipped:")
+        for s in skipped:
+            print(f"  {s[0]:<8} {s[1]:<10} dtype={s[2]:<6} variant={s[3]:<10} ({s[4]})")
     print("==============================\n")
+
 
 if __name__ == '__main__':
     main()

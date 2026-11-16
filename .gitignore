@@ -47,6 +47,7 @@ checkpoints/*
 # --- Generated output ---
 vis_video_depth/
 vis_video_depth_trt/
+depth_npz/
 
 # --- Logs / temp ---
 *.log
